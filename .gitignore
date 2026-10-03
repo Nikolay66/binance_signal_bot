@@ -1,0 +1,25 @@
+# Виртуальное окружение
+.venv/
+
+# Секреты
+.env
+config.py
+
+# Локальные данные бота
+signals.json
+signals_backup.json
+chat_id.txt
+signals.db
+signals_100.csv
+
+# Python
+__pycache__/
+*.py[cod]
+
+# IDE
+.vscode/
+.idea/
+
+# Логи
+*.log
+binance/ttt.txt
