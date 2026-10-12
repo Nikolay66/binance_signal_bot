@@ -6,7 +6,8 @@ def get_price(symbol):
 
     response = httpx.get(
         url,
-        params={"symbol": symbol}
+        params={"symbol": symbol},
+        timeout=10.0
     )
 
     response.raise_for_status()

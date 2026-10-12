@@ -3,7 +3,7 @@
 
 # Секреты
 .env
-config.py
+
 
 # Локальные данные бота
 signals.json

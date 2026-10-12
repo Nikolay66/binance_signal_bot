@@ -70,7 +70,8 @@ def get_klines(symbol, interval="15m", limit=10):
             "symbol": symbol,
             "interval": interval,
             "limit": limit
-        }
+        },
+        timeout=15.0
     )
 
     response.raise_for_status()
@@ -221,6 +222,12 @@ def analyze_market(symbol="BTCUSDT", interval="15m", limit=15):
     else:
         volume_balance = bullish_volume / bearish_volume
 
+    if volume_balance > 1:
+        volume_direction = "bullish"
+    elif volume_balance < 1:
+        volume_direction = "bearish"
+    else:
+        volume_direction = "neutral"
     # =========================
     # 1. ТРЕНД
     # =========================
@@ -624,6 +631,7 @@ def analyze_market(symbol="BTCUSDT", interval="15m", limit=15):
         "price_position": round(price_position, 2),
         "rsi": round(rsi, 2),
         "volume_balance": round(volume_balance, 2),
+        "volume_direction": volume_direction,
         "score": score,
         "signal": signal,
         "initial_signal": initial_signal,
@@ -728,7 +736,7 @@ if __name__ == "__main__":
 
 
 def scan_market():
-    symbols = get_top_volume_symbols(30)
+    symbols = get_top_volume_symbols(100)
 
     results = []
     no_trade_results = []
@@ -744,6 +752,7 @@ def scan_market():
             initial_signal = result["initial_signal"]
             trend = result["trend"]
             trend_1h = get_1h_trend(symbol)
+            btc_trend_1h = get_1h_trend("BTCUSDT")
             score = result["score"]
             risk_reward = result["risk_reward"]
             score_reasons = result["score_reasons"]
@@ -852,17 +861,21 @@ def scan_market():
             signal_record = {
                 "signal_time": signal_time,
                 "symbol": symbol,
+                "btc_trend_1h": btc_trend_1h,
                 "initial_signal": initial_signal,
                 "signal": signal,
                 "entry_price": entry_price,
                 "stop_loss": stop_loss,
                 "take_profit": take_profit,
                 "score": score,
+                "score_reasons": result["score_reasons"],
                 "trend_1h": trend_1h,
                 "risk_reward": risk_reward,
                 "risk_percent": risk_percent,
                 "reward_percent": reward_percent,
                 "confidence": result["confidence"],
+                "volume_direction": result["volume_direction"],
+                "volume_balance": result["volume_balance"],
                 "status": "ACTIVE",
                 "result": None
             }
