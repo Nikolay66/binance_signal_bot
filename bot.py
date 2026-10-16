@@ -1376,7 +1376,6 @@ async def auto_scan(context: ContextTypes.DEFAULT_TYPE):
     LAST_SCAN_TIME = datetime.now()
 
     try:
-        check_active_signals()
         if CHAT_ID is None:
             print("AUTO SCAN: Chat ID ещё не получен. Нажмите /start.")
             return
@@ -1428,6 +1427,15 @@ async def auto_scan(context: ContextTypes.DEFAULT_TYPE):
         SCAN_RUNNING = False
 
 
+async def check_signals_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        print("🔎 Проверка активных сигналов...")
+        await asyncio.to_thread(check_active_signals)
+        print("✅ Проверка активных сигналов завершена.")
+    except Exception as error:
+        print(f"❌ CHECK SIGNALS ERROR: {error}")
+
+
 def main():
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
@@ -1445,6 +1453,12 @@ def main():
         auto_scan,
         interval=900,
         first=10
+    )
+
+    application.job_queue.run_repeating(
+        check_signals_job,
+        interval=60,
+        first=15
     )
 
     print("Бот запущен...")
