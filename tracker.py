@@ -1,21 +1,44 @@
 import json
+import os
+import shutil
+import threading
+import time
 from datetime import datetime
-from binance.client import get_price
+from binance.client import get_price, get_klines_since
 
 SIGNALS_FILE = "signals.json"
+TS_FORMAT = "%Y-%m-%d %H:%M:%S"
+MINUTE_MS = 60_000
+
+# Один замок на все операции с файлом: save_signal (поток сканера) и
+# check_active_signals (поток проверки) раньше могли затереть друг друга.
+_file_lock = threading.RLock()
 
 
-def save_signal(signal):
+def _read_signals():
     try:
         with open(SIGNALS_FILE, "r", encoding="utf-8") as file:
-            signals = json.load(file)
+            return json.load(file)
 
-    except (FileNotFoundError, json.JSONDecodeError):
-        signals = []
+    except FileNotFoundError:
+        return []
 
-    signals.append(signal)
+    except json.JSONDecodeError:
+        # не затираем повреждённый файл молча - сохраняем копию
+        backup = f"{SIGNALS_FILE}.corrupt-{int(time.time())}"
+        try:
+            shutil.copy(SIGNALS_FILE, backup)
+            print(f"⚠️ {SIGNALS_FILE} повреждён, копия: {backup}")
+        except OSError:
+            pass
+        return []
 
-    with open(SIGNALS_FILE, "w", encoding="utf-8") as file:
+
+def _write_signals(signals):
+    # атомарная запись: сначала временный файл, потом замена
+    tmp_name = SIGNALS_FILE + ".tmp"
+
+    with open(tmp_name, "w", encoding="utf-8") as file:
         json.dump(
             signals,
             file,
@@ -23,14 +46,19 @@ def save_signal(signal):
             indent=4
         )
 
+    os.replace(tmp_name, SIGNALS_FILE)
+
+
+def save_signal(signal):
+    with _file_lock:
+        signals = _read_signals()
+        signals.append(signal)
+        _write_signals(signals)
+
 
 def get_active_signals():
-    try:
-        with open(SIGNALS_FILE, "r", encoding="utf-8") as file:
-            signals = json.load(file)
-
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
+    with _file_lock:
+        signals = _read_signals()
 
     return [
         signal
@@ -2156,90 +2184,202 @@ def get_statistics():
     }
 
 
-def update_signal(index, status, result):
-    try:
-        with open(SIGNALS_FILE, "r", encoding="utf-8") as file:
-            signals = json.load(file)
+def update_signal(index, status, result, extra=None):
+    with _file_lock:
+        signals = _read_signals()
 
-    except (FileNotFoundError, json.JSONDecodeError):
-        return
+        if index >= len(signals):
+            return
 
-    signals[index]["status"] = status
-    signals[index]["result"] = result
+        signals[index]["status"] = status
+        signals[index]["result"] = result
+        signals[index]["result_time"] = datetime.now().strftime(TS_FORMAT)
 
-    # Время закрытия сигнала
-    from datetime import datetime
+        if extra:
+            signals[index].update(extra)
 
-    signals[index]["result_time"] = datetime.now().strftime(
-        "%Y-%m-%d %H:%M:%S")
+        _write_signals(signals)
 
-    with open(SIGNALS_FILE, "w", encoding="utf-8") as file:
-        json.dump(
-            signals,
-            file,
-            ensure_ascii=False,
-            indent=4
+
+def _first_candle_open(signal):
+    """Открытие первой минутной свечи ПОСЛЕ создания сигнала (мс).
+
+    Свечу, в которой появился сигнал, пропускаем: часть её диапазона
+    была до входа."""
+    created_ms = signal.get("created_ms")
+
+    if not created_ms:
+        # старые записи: signal_time - локальное время машины бота
+        created_ms = int(
+            datetime.strptime(signal["signal_time"], TS_FORMAT).timestamp()
+            * 1000
         )
+
+    return (int(created_ms) // MINUTE_MS + 1) * MINUTE_MS
 
 
 def check_signal(signal):
+    """Проверка сигнала по 1m-свечам (high/low), а не по цене раз в минуту.
+
+    Если в одной свече задеты и SL, и TP - порядок неизвестен, считаем SL
+    (консервативно).
+
+    Возвращает словарь обновлений для записи сигнала (прогресс отслеживания,
+    а при срабатывании ещё status/result/result_time/mfe_r/mae_r) или None,
+    если данных пока нет."""
     symbol = signal["symbol"]
+    is_long = signal["signal"] == "LONG"
 
-    current_price = get_price(symbol)
+    entry = signal["entry_price"]
+    stop_loss = signal["stop_loss"]
+    take_profit = signal["take_profit"]
 
-    if signal["signal"] == "LONG":
+    cursor = max(
+        _first_candle_open(signal),
+        int(signal.get("track_from_ms") or 0)
+    )
 
-        if current_price >= signal["take_profit"]:
-            return "TP"
+    high_seen = signal.get("high_since_entry", entry)
+    low_seen = signal.get("low_since_entry", entry)
 
-        if current_price <= signal["stop_loss"]:
-            return "SL"
+    last_open = None
+    outcome = None
+    ambiguous = False
+    hit_open = None
 
-    elif signal["signal"] == "SHORT":
+    while True:
+        candles = get_klines_since(symbol, cursor)
 
-        if current_price <= signal["take_profit"]:
-            return "TP"
+        if not candles:
+            break
 
-        if current_price >= signal["stop_loss"]:
-            return "SL"
+        for candle in candles:
+            open_ms = int(candle[0])
+            high = float(candle[2])
+            low = float(candle[3])
 
-    return None
+            last_open = open_ms
+            high_seen = max(high_seen, high)
+            low_seen = min(low_seen, low)
+
+            if is_long:
+                sl_hit = low <= stop_loss
+                tp_hit = high >= take_profit
+            else:
+                sl_hit = high >= stop_loss
+                tp_hit = low <= take_profit
+
+            if sl_hit or tp_hit:
+                outcome = "SL" if sl_hit else "TP"
+                ambiguous = sl_hit and tp_hit
+                hit_open = open_ms
+                break
+
+        if outcome is not None or len(candles) < 1500:
+            break
+
+        cursor = int(candles[-1][0]) + MINUTE_MS
+
+    if last_open is None:
+        return None
+
+    updates = {
+        "track_from_ms": last_open,
+        "high_since_entry": high_seen,
+        "low_since_entry": low_seen
+    }
+
+    if outcome is not None:
+        risk = abs(entry - stop_loss)
+
+        if is_long:
+            mfe = (high_seen - entry) / risk
+            mae = (entry - low_seen) / risk
+        else:
+            mfe = (entry - low_seen) / risk
+            mae = (high_seen - entry) / risk
+
+        updates.update({
+            "status": outcome,
+            "result": outcome,
+            "result_time": datetime.fromtimestamp(
+                hit_open / 1000
+            ).strftime(TS_FORMAT),
+            "ambiguous": ambiguous,
+            "mfe_r": round(max(mfe, 0.0), 3),
+            "mae_r": round(max(mae, 0.0), 3)
+        })
+
+    return updates
 
 
 def check_active_signals():
-    try:
-        with open(SIGNALS_FILE, "r", encoding="utf-8") as file:
-            signals = json.load(file)
+    # 1) быстро читаем список, без сетевых запросов под замком
+    with _file_lock:
+        signals = _read_signals()
 
-    except (FileNotFoundError, json.JSONDecodeError):
+    pending = [
+        (index, dict(signal))
+        for index, signal in enumerate(signals)
+        if signal.get("status") == "ACTIVE"
+    ]
+
+    if not pending:
         return
 
-    changed = False
+    # 2) сетевые запросы
+    results = []
 
-    for index, signal in enumerate(signals):
+    for index, signal in pending:
+        try:
+            updates = check_signal(signal)
 
-        if signal.get("status") != "ACTIVE":
+        except Exception as error:
+            print(
+                f"⚠️ {signal.get('symbol')}: "
+                f"не удалось проверить сигнал: {error}"
+            )
             continue
 
-        result = check_signal(signal)
+        if updates:
+            results.append((index, signal, updates))
 
-        if result is None:
-            continue
+    if not results:
+        return
 
-        update_signal(
-            index,
-            result,
-            result
-        )
+    # 3) применяем к свежей версии файла
+    closed = 0
 
-        print(
-            f"🎯 {signal['symbol']} — "
-            f"{result}"
-        )
+    with _file_lock:
+        signals = _read_signals()
 
-        changed = True
+        for index, original, updates in results:
+            if index >= len(signals):
+                continue
 
-    if changed:
+            current = signals[index]
+
+            if (
+                current.get("symbol") != original.get("symbol")
+                or current.get("signal_time") != original.get("signal_time")
+                or current.get("status") != "ACTIVE"
+            ):
+                continue
+
+            current.update(updates)
+
+            if updates.get("status") in ("TP", "SL"):
+                closed += 1
+                print(
+                    f"🎯 {current['symbol']} — "
+                    f"{updates['status']}"
+                    + (" (SL и TP в одной свече, засчитан SL)"
+                       if updates.get("ambiguous") else "")
+                )
+
+        _write_signals(signals)
+
+    if closed:
         print("✅ Результаты сигналов обновлены.")
 
 

@@ -34,6 +34,27 @@ def get_klines(symbol, interval="1m", limit=100):
     return response.json()
 
 
+def get_klines_since(symbol, start_ms, interval="1m", limit=1500):
+    """Свечи, открывшиеся не раньше start_ms (мс). Последняя свеча может
+    быть ещё не закрыта - ей можно доверять по high/low "на текущий момент"."""
+    url = "https://fapi.binance.com/fapi/v1/klines"
+
+    response = httpx.get(
+        url,
+        params={
+            "symbol": symbol,
+            "interval": interval,
+            "startTime": int(start_ms),
+            "limit": limit
+        },
+        timeout=15.0
+    )
+
+    response.raise_for_status()
+
+    return response.json()
+
+
 def format_candle(candle):
     return {
         "open": float(candle[1]),

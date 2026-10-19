@@ -1,7 +1,22 @@
+import time
 import httpx
 from tracker import save_signal, has_active_signal
 from datetime import datetime
 from binance.client import get_1h_trend
+
+# Фильтры по результатам replay на свечных данных (949 сделок):
+# широкие стопы (>1.5%) и RR < 2 давали основной убыток.
+MIN_RISK_REWARD = 2.0
+MAX_RISK_PERCENT = 1.5
+
+
+def round_price(value):
+    """7 значащих цифр. Раньше round(x, 5) у дешёвых монет (VTHO, PUMP)
+    сливал entry/SL/TP в одно значение."""
+    if value is None:
+        return None
+
+    return float(f"{value:.7g}")
 
 
 def get_futures_symbols():
@@ -449,16 +464,26 @@ def analyze_market(symbol="BTCUSDT", interval="15m", limit=15):
         risk_reward = None
 
     rr_blocked = False
+    rr_block_reason = None
 
-    # Фильтр Risk/Reward
+    # Фильтр Risk/Reward и ширины стопа
 
     if signal in ["LONG", "SHORT"]:
-        if risk_reward is None or risk_reward < 1.5:
+        if risk_reward is None or risk_reward < MIN_RISK_REWARD:
+            rr_block_reason = (
+                "недостаточное соотношение риск/прибыль"
+            )
+
+        elif risk_percent is None or risk_percent > MAX_RISK_PERCENT:
+            rr_block_reason = (
+                f"стоп слишком широкий ({risk_percent:.2f}% "
+                f"> {MAX_RISK_PERCENT}%)"
+            )
+
+        if rr_block_reason is not None:
             signal = "NO TRADE"
             rr_blocked = True
-            signal_reason = (
-                "NO TRADE — недостаточное соотношение риск/прибыль"
-            )
+            signal_reason = f"NO TRADE — {rr_block_reason}"
 
     if signal == "LONG":
         signal_reason = "Факторы сигнала LONG:\n"
@@ -508,9 +533,7 @@ def analyze_market(symbol="BTCUSDT", interval="15m", limit=15):
 
     else:
         if rr_blocked:
-            signal_reason = (
-                "NO TRADE — недостаточное соотношение риск/прибыль"
-            )
+            signal_reason = f"NO TRADE — {rr_block_reason}"
 
         elif trend_blocked:
             signal_reason = (
@@ -619,10 +642,12 @@ def analyze_market(symbol="BTCUSDT", interval="15m", limit=15):
         reasons.append("⚪ Объёмы примерно равны")
 
     signal_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    created_ms = int(time.time() * 1000)
 
     return {
         "symbol": symbol,
         "signal_time": signal_time,
+        "created_ms": created_ms,
         "trend": trend,
         "resistance": resistance,
         "support": support,
@@ -635,9 +660,9 @@ def analyze_market(symbol="BTCUSDT", interval="15m", limit=15):
         "score": score,
         "signal": signal,
         "initial_signal": initial_signal,
-        "entry_price": round(entry_price, 5),
-        "stop_loss": round(stop_loss, 5) if stop_loss is not None else None,
-        "take_profit": round(take_profit, 5) if take_profit is not None else None,
+        "entry_price": round_price(entry_price),
+        "stop_loss": round_price(stop_loss),
+        "take_profit": round_price(take_profit),
         "risk_reward": round(risk_reward, 2) if risk_reward is not None else None,
         "risk_percent": round(risk_percent, 2) if risk_percent is not None else None,
         "reward_percent": round(reward_percent, 2) if reward_percent is not None else None,
@@ -695,7 +720,7 @@ def format_analysis(result):
             )
 
         elif result["rr_blocked"]:
-            text += "🚫 Сделка заблокирована фильтром R:R\n"
+            text += "🚫 Сделка заблокирована фильтром риска (R:R / ширина стопа)\n"
 
         else:
             text += "🚫 Сделка заблокирована\n"
@@ -798,7 +823,8 @@ def scan_market():
                 elif result["rr_blocked"]:
                     print(
                         f"⚠️ {symbol} — сигнал {initial_signal} "
-                        f"отклонён из-за R:R: {risk_reward}"
+                        f"отклонён фильтром риска: "
+                        f"R:R {risk_reward}, стоп {risk_percent}%"
                     )
 
                 else:
@@ -845,10 +871,17 @@ def scan_market():
                 print(f"❌ {symbol} — R:R отсутствует")
                 continue
 
-            if risk_reward < 1.5:
+            if risk_reward < MIN_RISK_REWARD:
                 print(
                     f"❌ {symbol} — "
                     f"R:R слишком низкий: {risk_reward}"
+                )
+                continue
+
+            if risk_percent is None or risk_percent > MAX_RISK_PERCENT:
+                print(
+                    f"❌ {symbol} — "
+                    f"стоп слишком широкий: {risk_percent}%"
                 )
                 continue
             if has_active_signal(symbol, signal):
@@ -860,6 +893,7 @@ def scan_market():
 
             signal_record = {
                 "signal_time": signal_time,
+                "created_ms": result["created_ms"],
                 "symbol": symbol,
                 "btc_trend_1h": btc_trend_1h,
                 "initial_signal": initial_signal,
