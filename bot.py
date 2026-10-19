@@ -1457,7 +1457,7 @@ def main():
 
     application.job_queue.run_repeating(
         check_signals_job,
-        interval=60,
+        interval=300,
         first=15
     )
 
